@@ -1,1 +1,4 @@
-eval/out/
+# Local eval output (trial runs, logs, state exports) — never committed.
+eval/
+*.log
+/tmp/
