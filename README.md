@@ -1,123 +1,109 @@
-# free-model-aggregator-01
+# free-model-aggregator-01 v2 — quality-ranked free-model aggregator
 
-One server that serves the OpenAI Chat Completions API and the Anthropic
-Messages API (JSON and SSE) by routing each request to the best free model
-that can serve it, across ten simulated free-tier providers that speak the
-real OpenAI, Anthropic and Gemini wires — with failover when a provider
-refuses, and a `--list` of the catalog it read.
-
-## Run
-
-Node 22, standard library only. Nothing is installed.
-
-```sh
-node main.ts            # trial mode: reads $MAKEFUN_PROMPT_FILE, probes the
-                        # providers under $MAKEFUN_ENV_URL, registers, serves
-                        # the 20 requests, exits 0 when GET /work says done
-node main.ts --list     # print the catalog document and exit 0
-```
-
-Outside a trial (no `MAKEFUN_PROMPT_FILE` and no `MAKEFUN_ENV_URL`),
-`--list` prints `{"providers":[]}`.
-
-## How it routes
-
-- At startup it probes every provider's catalog route in that provider's own
-  wire and auth scheme (`Authorization: Bearer`, `x-api-key`,
-  `x-goog-api-key`, or none) and builds one catalog: provider id, base URL
-  (the provider's own path, e.g. `/p/groq`), key variable, wire, and each
-  model with its free flag and context length. The catalog `--list` prints
-  is the same document the register body carries, byte for byte.
-- For each request it ranks every free model that meets the request's
-  requirements (tools, vision, JSON mode, minimum context) by the quality
-  table's rating, highest first, spreading ties across the least-used
-  providers. A paid model is never picked.
-- A provider that answers 402, 429, 5xx, or is unreachable is failed over
-  at once: the request is retried on the next-best free model that meets
-  it. A provider that fails twice in a row is treated as spent for the rest
-  of the trial (and retried only if nothing else can serve a request).
-  A 400/401 spends no budget and is skipped without a strike.
-- An OpenAI JSON-mode request is never routed to an Anthropic-wire
-  provider: that wire cannot carry `response_format`, so its echo would
-  report JSON mode absent. Gemini carries it as
-  `generationConfig.responseMimeType`.
-
-## How it translates
-
-Every provider answer is reduced to one normalized shape — text, tool
-calls, usage, stop family — then rendered in the wire the client used, so
-all six combinations (OpenAI/Anthropic client × OpenAI/Anthropic/Gemini
-provider) share one path, JSON and streaming alike:
-
-- OpenAI client → OpenAI provider: passthrough (model replaced,
-  `stream_options.include_usage` added on streams so usage is reported).
-- Anthropic client → OpenAI provider: system prompt, image blocks, tool
-  definitions/results and tool choice rewritten to Chat Completions, and
-  the answer rewritten back to a Messages object or the
-  `message_start` / `content_block_*` / `message_delta` / `message_stop`
-  event sequence, with usage and stop reason mapped.
-- Either client → Gemini provider: `generateContent` /
-  `streamGenerateContent?alt=sse` with `systemInstruction`, `contents`,
-  `functionDeclarations` and `generationConfig` (`maxOutputTokens`,
-  `stopSequences`, `responseMimeType` for JSON mode); the answer's
-  candidates and `usageMetadata` mapped back to the client's wire.
-- The reverse directions are symmetric. System prompt, user text (images
-  included, as the same bytes, so the image hash matches), tool names in
-  order, `max_tokens`, stop sequences and JSON mode are passed through
-  untouched on every wire: the provider echoes what it parsed, and the
-  client compares that echo with what it sent.
-
-## Determinism
-
-No wall clock, no unseeded randomness. Fixed timestamps in model lists and
-responses, fixed response ids, one request at a time in arrival order, and
-every routing choice a function of the brief, the requests and the
-providers' answers — so a replayed trial leaves the same state export,
-byte for byte (verified: two runs of practice trial-0 produce identical
-`state.json`).
-
-## Local grading
-
-Practice trials from the kit (`grade-local` needs Docker; the equivalent
-manual run does not):
-
-```sh
-KIT=~/workspace/makefun/free-model-aggregator-01-kit
-# trial 0: start the env, run the server against it, export, score
-MAKEFUN_STATE_DIR=/tmp/fma-state0 \
-  MAKEFUN_ENV_DATA_DIR=$KIT/practice/trial-0/input/env \
-  MAKEFUN_ENV_PORT=18080 node $KIT/program/env/server.mjs &
-MAKEFUN_ENV_URL=http://127.0.0.1:18080 \
-  MAKEFUN_PROMPT_FILE=$KIT/practice/trial-0/input/prompt.txt \
-  node main.ts
-kill -TERM <env pid>   # env writes /tmp/fma-state0/export/state.json
-MAKEFUN_OUTPUT_DIR=/tmp/fma-state0/export \
-  MAKEFUN_REFERENCE_DIR=$KIT/practice/trial-0/reference \
-  MAKEFUN_SCORES_DIR=/tmp/fma-scores0 \
-  node $KIT/program/scorer/score.mjs
-```
-
-Results on the kit's practice instances (20 requests each):
-
-| trial | valid | score | quality | served | wire | failover | catalog | upstream calls |
-|-------|-------|-------|---------|--------|------|----------|---------|----------------|
-| 0 | 20/20 | 99 | 99 | 100 | 100 | 100 | 100 | 26 |
-| 1 | 20/20 | 99 | 99 | 100 | 100 | 100 | 100 | 30 |
-| 2 | 20/20 | 99 | 99 | 100 | 100 | 100 | 100 | 29 |
-
-Quality is 99 rather than 100 because the top-rated provider's free tier
-runs dry partway through a trial (e.g. OpenRouter's budget), so the last
-requests fall back to the next-best free model (1470 vs 1475) — the
-failover that keeps them served.
+One server, two client wires (OpenAI Chat Completions, Anthropic Messages),
+ten free-tier providers on three upstream wires (OpenAI, Anthropic, Gemini).
+For each of the twenty requests it picks the best free model that meets the
+request's requirements, fails over across providers when one refuses, and
+translates the answer back into the wire the client used, in JSON or in
+streaming.
 
 ## Layout
 
-- `main.ts` — the whole server: brief parsing, catalog probe, routing and
-  failover, all six wire translations, the HTTP server, register/poll.
-- `package.json` — `{"type": "module"}` so Node 22 runs `main.ts` as ESM
-  without a reparsing warning.
-- `LICENSE` — MIT.
+- `main.ts` — entrypoint: brief, catalog probe, plan, HTTP server, register,
+  `/work` poll, exit 0 when done. Also `--list`.
+- `lib/brief.ts` — the trial brief: provider directory, quality table,
+  workload manifest, parsed out of the prompt file by schema.
+- `lib/catalog.ts` — parallel catalog probes in each provider's own wire,
+  and the one catalog `--list` prints and registration carries.
+- `lib/plan.ts` — routing: quality-ranked candidates, the budget-aware
+  upfront plan, adaptive failover.
+- `lib/translate.ts` — request/answer translation between every
+  client×upstream wire pair, JSON and SSE.
+- `eval/bench.mjs` — local eval harness: runs the sealed practice env
+  standalone (no docker), grades with the sealed scorer, benchmarks
+  providers. Dev tooling only; the trial runs `main.ts` alone.
 
-## License
+## Routing
 
-MIT. See `LICENSE`.
+The brief's quality table rates every free model, and the manifest lists all
+twenty requests up front, so the router plans the whole workload before
+serving anything: weight-first, best-model-first, subject to a soft
+per-provider cap (the kit provider table's published minimum budgets:
+groq 9, cerebras 5, gemini 6, zai 4, openrouter 10, sambanova 4,
+pollinations 10, cloudflare 7, ovh 5, kilol 12). Inside one rating tier the
+provider with the fewest planned calls wins, so two providers sharing a
+rating (zai and cloudflare both serve `glm-4.7-flash` at 1470) split the
+load instead of one running dry.
+
+Failover: any refused call (402, 429, 5xx, timeout, unreachable) retries
+the next eligible model by rating, with refused providers pushed down 45
+milli per refusal and retried only after every untried provider has been
+tried; at most five provider calls per request. Exactly one provider call
+ever answers a request.
+
+Eligibility is the model's capabilities against the request's requirements.
+One wire rule on top: an OpenAI request in JSON mode goes only to an
+openai- or gemini-wire provider, because the Anthropic wire cannot carry
+JSON mode and its echo would report it absent.
+
+## Wire fidelity
+
+The trial's client compares the provider's echo of the request (system
+prompt, user text, tool names, `max_tokens`, stop sequences, image, JSON
+mode) with what it sent, so every translation moves those fields losslessly
+between wires: system prompt, user text, images (bytes never re-encoded),
+tool definitions and tool use/results, `max_tokens`, stops, JSON mode
+(`response_format` ↔ Gemini `responseMimeType`). Streaming is translated
+buffered — the whole upstream event stream is read first, then the client's
+event sequence is emitted — so usage is known before `message_start`, the
+stop reason before `message_delta`, and an OpenAI stream always ends with
+exactly one finish chunk, a usage chunk, and `[DONE]`.
+
+Extra routes (never used by the trial client): `GET /health` (liveness plus
+live routing counters), `GET /v1/providers` (catalog with per-provider
+calls/refusals/planned counts). Responses carry `x-aggregator-provider` and
+`x-aggregator-model` headers naming the model that answered.
+
+## Determinism
+
+Every routing choice is a function of the brief, the requests, and the
+providers' answers. No wall clock and no unseeded randomness anywhere in a
+request path, so a replay leaves the same state export byte for byte
+(verified: two runs of trial-0 produce identical state exports).
+
+## Measured results (local, sealed practice env + sealed scorer)
+
+`node eval/bench.mjs --trials=0,1,2 --bench --repeat=2`
+
+| trial | score | quality | served | wire | failover | catalog | calls |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
+| 1 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
+| 2 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
+
+Quality 99 is the practical ceiling: the best rating (1475) sits on one
+provider whose per-trial budget (10–12) cannot serve all 17 requests that
+want it, so the tail is served at 1470/1465 — a 0.3–0.7% quality cost per
+request for full coverage. `--list` output matches the registered catalog.
+
+Provider benchmark (trial-0 throwaway env, 1 inference call per provider):
+10/10 providers answer 200; average catalog-probe latency 7.5 ms, average
+inference round-trip 7.8 ms (loopback sim; the numbers rank providers, they
+are not production latencies).
+
+Direct endpoint exercise (live env, curl): `GET /health` 3 ms,
+`GET /v1/models` in both auth shapes, `GET /v1/providers`, `POST
+/v1/chat/completions` and `POST /v1/messages` in JSON (10 ms / 4 ms) and
+streaming (5 ms), all returning the provider echo whole with correct usage
+and stop reasons.
+
+## Running it
+
+```sh
+node main.ts --list   # print the catalog, exit 0
+node main.ts          # needs MAKEFUN_ENV_URL + MAKEFUN_PROMPT_FILE
+node eval/bench.mjs --trials=0,1,2 --bench   # local grade + benchmark
+```
+
+Node 22 standard library only; no dependencies. `main.ts` runs directly
+under Node 22's type stripping.
