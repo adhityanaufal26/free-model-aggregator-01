@@ -436,6 +436,9 @@ function argsObject(value: unknown): Json {
 
 function splitPieces(text: string, size: number): string[] {
   if (text === '') return [];
+  // A degenerate chunk size would loop forever (at += 0); fall back to
+  // a single piece instead of hanging the stream renderer.
+  if (!Number.isFinite(size) || size <= 0) return [text];
   const out: string[] = [];
   for (let at = 0; at < text.length; at += size) out.push(text.slice(at, at + size));
   return out;
