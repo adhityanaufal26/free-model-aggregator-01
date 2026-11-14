@@ -1,1 +1,1 @@
-{"description":"Quality-ranked free-model aggregator: one OpenAI- and Anthropic-compatible endpoint over ten free-tier providers.","license":"MIT","name":"free-model-aggregator-01","private":true,"type":"module","version":"2.0.0"}
+{"description":"Best free AI model aggregator: one server, OpenAI + Anthropic wires, ten free-tier providers, quality-ordered routing with dead-on-refusal failover.","engines":{"node":">=22"},"license":"MIT","main":"main.ts","name":"free-model-aggregator-01-v3","private":true,"type":"module","version":"1.0.0"}
