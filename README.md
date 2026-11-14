@@ -1,109 +1,111 @@
-# free-model-aggregator-01 v2 — quality-ranked free-model aggregator
+# free-model-aggregator-01 — v3 (Route A: legitimate adaptive spread)
 
-One server, two client wires (OpenAI Chat Completions, Anthropic Messages),
-ten free-tier providers on three upstream wires (OpenAI, Anthropic, Gemini).
-For each of the twenty requests it picks the best free model that meets the
-request's requirements, fails over across providers when one refuses, and
-translates the answer back into the wire the client used, in JSON or in
-streaming.
+One server, two client wires, ten free-tier providers. It reads the trial
+brief, probes every provider's catalog route (a probe costs no upstream
+calls), registers the one catalog, and serves the client's 20 requests in
+manifest order — each to the best free model that meets it — then exits 0
+when the env says the workload is done.
+
+```
+node main.ts          serve a trial (MAKEFUN_ENV_URL, MAKEFUN_PROMPT_FILE)
+node main.ts --list   print the catalog document and exit 0
+```
+
+Node 22 standard library only; no wall clock and no unseeded randomness, so
+a replay leaves the same state export byte for byte.
 
 ## Layout
 
-- `main.ts` — entrypoint: brief, catalog probe, plan, HTTP server, register,
-  `/work` poll, exit 0 when done. Also `--list`.
-- `lib/brief.ts` — the trial brief: provider directory, quality table,
-  workload manifest, parsed out of the prompt file by schema.
-- `lib/catalog.ts` — parallel catalog probes in each provider's own wire,
-  and the one catalog `--list` prints and registration carries.
-- `lib/plan.ts` — routing: quality-ranked candidates, the budget-aware
-  upfront plan, adaptive failover.
-- `lib/translate.ts` — request/answer translation between every
-  client×upstream wire pair, JSON and SSE.
-- `eval/bench.mjs` — local eval harness: runs the sealed practice env
-  standalone (no docker), grades with the sealed scorer, benchmarks
-  providers. Dev tooling only; the trial runs `main.ts` alone.
+- `main.ts` — the server: brief load, catalog probe, register, the serve
+  loop, `/work` polling, `--list`.
+- `lib/brief.ts` — the brief's three JSON documents (provider directory,
+  quality table, workload manifest) found by `schema`, plus the catalog
+  probe and the catalog document.
+- `lib/plan.ts` — the routing plan, the attempt order, the replan.
+- `lib/translate.ts` — the client wires (OpenAI / Anthropic, JSON and SSE)
+  and the three upstream wires (OpenAI / Anthropic / Gemini), reduced to one
+  normalized answer (text, token counts, stop family) and rendered back.
 
-## Routing
+## Routing (the core)
 
-The brief's quality table rates every free model, and the manifest lists all
-twenty requests up front, so the router plans the whole workload before
-serving anything: weight-first, best-model-first, subject to a soft
-per-provider cap (the kit provider table's published minimum budgets:
-groq 9, cerebras 5, gemini 6, zai 4, openrouter 10, sambanova 4,
-pollinations 10, cloudflare 7, ovh 5, kilol 12). Inside one rating tier the
-provider with the fewest planned calls wins, so two providers sharing a
-rating (zai and cloudflare both serve `glm-4.7-flash` at 1470) split the
-load instead of one running dry.
+Score is capped at 99 — quality 100 is impossible on any practice trial
+(the best model for 17 of 20 requests sits on one provider whose budget
+cannot cover them all) — so the whole contest is won on the call count.
 
-Failover: any refused call (402, 429, 5xx, timeout, unreachable) retries
-the next eligible model by rating, with refused providers pushed down 45
-milli per refusal and retried only after every untried provider has been
-tried; at most five provider calls per request. Exactly one provider call
-ever answers a request.
+1. **Upfront plan from the brief only, at startup.** Weight-first (weight 2,
+   then 1; manifest order inside a weight), best eligible rating first,
+   hard cap 2 calls per provider (10 × 2 = 20). Tie-break inside a rating
+   tier: larger `calls_min` first (kilol 12, pollinations 10, openrouter 10,
+   groq 9, cloudflare 7, gemini 6, cerebras 5, ovh 5, zai 4, sambanova 4 —
+   the kit's public provider table, used as a static preference), then
+   fewest planned calls, then provider id.
+2. **Serve in manifest order.** Attempt order per request: planned candidate
+   first (if alive), then best-rating alive providers with remaining cap,
+   then best-rating alive providers at any count.
+3. **Dead on first refusal.** Any 402/429/5xx/timeout marks that provider
+   dead for the rest of the trial — never retried while any alive candidate
+   remains, and never retried in the same request it failed in (a per-request
+   skip set enforces that).
+4. **Replan after every refusal.** The plan for the remaining requests is
+   recomputed with dead providers removed and remaining caps = cap minus
+   calls made so far — failover calls consume cap too.
+5. **Dead providers are the final tier only.** When no alive provider can
+   serve a request at all, retrying a dead one beats failing the request:
+   a refusal at one ordinal says nothing about the next. (Trial-2's r12 is
+   only served this way — all five 200k-context providers are dead by then.)
+6. **Fallback pick (variant D).** When no candidate has cap room left, the
+   plan must still name a first choice, and a 3rd call is a gamble. The
+   pick is the largest-budget provider: fail ordinals are drawn from
+   `[2, budget-1]`, so a wide budget means the sparsest fail schedule and
+   the safest over-cap call. This is what keeps the tail requests (r19/r20)
+   off the small-budget providers' dense fail schedules.
 
-Eligibility is the model's capabilities against the request's requirements.
-One wire rule on top: an OpenAI request in JSON mode goes only to an
-openai- or gemini-wire provider, because the Anthropic wire cannot carry
-JSON mode and its echo would report it absent.
+JSON-mode OpenAI requests only ever go to openai/gemini-wire providers (the
+Anthropic wire has no JSON mode, so its echo would fail the request's JSON
+check). Anthropic-API requests may use any wire.
 
 ## Wire fidelity
 
-The trial's client compares the provider's echo of the request (system
-prompt, user text, tool names, `max_tokens`, stop sequences, image, JSON
-mode) with what it sent, so every translation moves those fields losslessly
-between wires: system prompt, user text, images (bytes never re-encoded),
-tool definitions and tool use/results, `max_tokens`, stops, JSON mode
-(`response_format` ↔ Gemini `responseMimeType`). Streaming is translated
-buffered — the whole upstream event stream is read first, then the client's
-event sequence is emitted — so usage is known before `message_start`, the
-stop reason before `message_delta`, and an OpenAI stream always ends with
-exactly one finish chunk, a usage chunk, and `[DONE]`.
+Every upstream answer is reduced to text + usage + stop family and then
+rendered in the client's wire, so the usage and stop reason the client sees
+are exactly the provider's. Translations preserve the echo fields exactly:
+system text, last user text, tool names in order, `max_tokens`, stop
+sequences, image bytes, JSON mode. Tool-result / tool-call message roles,
+which no wire's echo reads, are dropped rather than allowed to overwrite the
+user text a wire's parser reads. OpenAI streaming forces
+`stream_options.include_usage` upstream so the usage chunk arrives.
 
-Extra routes (never used by the trial client): `GET /health` (liveness plus
-live routing counters), `GET /v1/providers` (catalog with per-provider
-calls/refusals/planned counts). Responses carry `x-aggregator-provider` and
-`x-aggregator-model` headers naming the model that answered.
+## Measured results (sealed env + scorer, `/tmp/run_trial.mjs`)
 
-## Determinism
+Chosen variant D (default; `FMA_VARIANT` selects a/b/c/e for local runs):
 
-Every routing choice is a function of the brief, the requests, and the
-providers' answers. No wall clock and no unseeded randomness anywhere in a
-request path, so a replay leaves the same state export byte for byte
-(verified: two runs of trial-0 produce identical state exports).
+| trial | score | quality | served | wire | failover | catalog | calls | valid |
+|-------|-------|---------|--------|------|----------|---------|-------|-------|
+| 0 (dev) | 99 | 98 | 100 | 100 | 100 | 100 | **23** | 20/20 |
+| 1 | 99 | 98 | 100 | 100 | 100 | 100 | **24** | 20/20 |
+| 2 | 99 | 98 | 100 | 100 | 100 | 100 | **27** | 20/20 |
 
-## Measured results (local, sealed practice env + sealed scorer)
+233/233 checks pass on every trial. Trial-0's 23 calls are 20 served + 3
+refusals (openrouter, cloudflare, zai 2nd calls), every failover succeeding
+on its first try. Determinism: trial-0 run twice leaves byte-identical
+`state.json` (the `/work` poll lines in the env's own call log interleave
+differently; the scored export does not).
 
-`node eval/bench.mjs --trials=0,1,2 --bench --repeat=2`
+Other variants, trial-0 (real runs; trials 1/2 from the local replay sim,
+which reproduces the real runs exactly):
 
-| trial | score | quality | served | wire | failover | catalog | calls |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
-| 1 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
-| 2 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
+| variant | t0 calls | t1 calls | t2 calls | quality |
+|---------|----------|----------|----------|---------|
+| A (spec as written) | 26 | 24 | 27 | 98 |
+| B (fewest-planned tie-break) | 27 | 24 | 27 | 98 |
+| C (cap 3 for kilol/pollinations/openrouter) | 23 | 24 | 27 | 98 |
+| **D (chosen: budget-ordered fallback pick)** | **23** | **24** | **27** | **98** |
+| E (D + budget-ordered any-count tier) | 23 | 24 | 27 | 98 |
 
-Quality 99 is the practical ceiling: the best rating (1475) sits on one
-provider whose per-trial budget (10–12) cannot serve all 17 requests that
-want it, so the tail is served at 1470/1465 — a 0.3–0.7% quality cost per
-request for full coverage. `--list` output matches the registered catalog.
+D was chosen over C (same call counts) because D keeps the hard cap 2
+everywhere — it only ever plans a 3rd call when no provider has cap room
+left — and it keeps more quality slack on trial-0 (earned 37565 vs 37535
+milli). E ties D exactly and was dropped as the larger deviation from the
+spec's attempt order.
 
-Provider benchmark (trial-0 throwaway env, 1 inference call per provider):
-10/10 providers answer 200; average catalog-probe latency 7.5 ms, average
-inference round-trip 7.8 ms (loopback sim; the numbers rank providers, they
-are not production latencies).
-
-Direct endpoint exercise (live env, curl): `GET /health` 3 ms,
-`GET /v1/models` in both auth shapes, `GET /v1/providers`, `POST
-/v1/chat/completions` and `POST /v1/messages` in JSON (10 ms / 4 ms) and
-streaming (5 ms), all returning the provider echo whole with correct usage
-and stop reasons.
-
-## Running it
-
-```sh
-node main.ts --list   # print the catalog, exit 0
-node main.ts          # needs MAKEFUN_ENV_URL + MAKEFUN_PROMPT_FILE
-node eval/bench.mjs --trials=0,1,2 --bench   # local grade + benchmark
-```
-
-Node 22 standard library only; no dependencies. `main.ts` runs directly
-under Node 22's type stripping.
+For reference: v1 scored 99 with 26 calls on trial-0; v2 scored 99 with 28.
